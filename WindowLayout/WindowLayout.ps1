@@ -20,6 +20,7 @@ Add-Type -AssemblyName System.Windows.Forms
 $nativeSource = @"
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -69,6 +70,9 @@ public static class WindowLayoutNative
     [DllImport("user32.dll")]
     public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
 
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmGetWindowAttribute(IntPtr hwnd, int dwAttribute, out int pvAttribute, int cbAttribute);
+
     public static List<IntPtr> GetTopLevelWindows()
     {
         List<IntPtr> windows = new List<IntPtr>();
@@ -93,6 +97,76 @@ public static class WindowLayoutNative
         StringBuilder builder = new StringBuilder(256);
         GetClassName(hWnd, builder, builder.Capacity);
         return builder.ToString();
+    }
+
+    public static int GetWindowCloakedValue(IntPtr hWnd)
+    {
+        int cloaked = 0;
+        int result = DwmGetWindowAttribute(hWnd, 14, out cloaked, Marshal.SizeOf(typeof(int)));
+        if (result != 0)
+        {
+            return 0;
+        }
+
+        return cloaked;
+    }
+}
+
+[ComImport]
+[Guid("A5CD92FF-29BE-454C-8D04-D82879FB3F1B")]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+public interface IVirtualDesktopManager
+{
+    [PreserveSig]
+    int IsWindowOnCurrentVirtualDesktop(IntPtr topLevelWindow, out bool onCurrentDesktop);
+
+    [PreserveSig]
+    int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
+
+    [PreserveSig]
+    int MoveWindowToDesktop(IntPtr topLevelWindow, [MarshalAs(UnmanagedType.LPStruct)] Guid desktopId);
+}
+
+[ComImport]
+[Guid("AA509086-5CA9-4C25-8F95-589D3C07B48A")]
+public class VirtualDesktopManagerCom
+{
+}
+
+public static class VirtualDesktopHelper
+{
+    private static readonly Lazy<IVirtualDesktopManager> _manager = new Lazy<IVirtualDesktopManager>(() =>
+        (IVirtualDesktopManager)new VirtualDesktopManagerCom(), LazyThreadSafetyMode.ExecutionAndPublication);
+
+    public static Guid? GetWindowDesktopId(IntPtr hWnd)
+    {
+        try
+        {
+            Guid desktopId;
+            int hr = _manager.Value.GetWindowDesktopId(hWnd, out desktopId);
+            if (hr != 0)
+            {
+                return null;
+            }
+
+            return desktopId;
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    public static bool MoveWindowToDesktop(IntPtr hWnd, Guid desktopId)
+    {
+        try
+        {
+            return _manager.Value.MoveWindowToDesktop(hWnd, desktopId) == 0;
+        }
+        catch
+        {
+            return false;
+        }
     }
 }
 "@
@@ -137,7 +211,7 @@ function Show-MenuHeader {
 
 function Ensure-ConfigFile {
     if (-not (Test-Path -LiteralPath $script:ConfigPath)) {
-        Set-Content -LiteralPath $script:ConfigPath -Value '' -Encoding UTF8
+        [System.IO.File]::WriteAllText($script:ConfigPath, '', (New-Object System.Text.UTF8Encoding($true)))
     }
 }
 
@@ -541,13 +615,72 @@ function Write-FormattedConfigIfNeeded {
         [AllowEmptyString()][string]$FormattedText
     )
 
-    $existing = if (Test-Path -LiteralPath $Path) { Get-Content -LiteralPath $Path -Raw -Encoding UTF8 } else { '' }
+    $existing = if (Test-Path -LiteralPath $Path) { [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8) } else { '' }
     if ($existing -ne $FormattedText) {
-        Set-Content -LiteralPath $Path -Value $FormattedText -Encoding UTF8
+        [System.IO.File]::WriteAllText($Path, $FormattedText, (New-Object System.Text.UTF8Encoding($true)))
         return $true
     }
 
     return $false
+}
+
+function ConvertTo-ShortcutFileName {
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $safeName = $Name
+    foreach ($invalidChar in [System.IO.Path]::GetInvalidFileNameChars()) {
+        $safeName = $safeName.Replace([string]$invalidChar, '_')
+    }
+
+    return $safeName.TrimEnd(' ', '.')
+}
+
+function Get-LayoutShortcutContent {
+    param([Parameter(Mandatory = $true)][string]$LayoutLabel)
+
+    $escapedLayoutLabel = $LayoutLabel.Replace('"', '""')
+    return ('..\WindowLayout.cmd -ApplyLayout "{0}"' -f $escapedLayoutLabel) + [Environment]::NewLine
+}
+
+function Sync-LayoutShortcutScripts {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $expectedFiles = @{}
+    foreach ($layout in $Config.layouts) {
+        $layoutLabel = "$($layout.monitorSetup) - $($layout.name)"
+        $fileName = ConvertTo-ShortcutFileName -Name ("WindowLayout - {0}.cmd" -f $layoutLabel)
+        $expectedFiles[$fileName] = Get-LayoutShortcutContent -LayoutLabel $layoutLabel
+    }
+
+    $existingFiles = @{}
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:RootDirectory -Filter '*.cmd' -File)) {
+        $existingFiles[$file.Name] = Get-Content -LiteralPath $file.FullName -Raw
+    }
+
+    $needsSync = $existingFiles.Count -ne $expectedFiles.Count
+    if (-not $needsSync) {
+        foreach ($fileName in $expectedFiles.Keys) {
+            if (-not $existingFiles.ContainsKey($fileName) -or $existingFiles[$fileName] -ne $expectedFiles[$fileName]) {
+                $needsSync = $true
+                break
+            }
+        }
+    }
+
+    if (-not $needsSync) {
+        return $false
+    }
+
+    foreach ($file in @(Get-ChildItem -LiteralPath $script:RootDirectory -Filter '*.cmd' -File)) {
+        Remove-Item -LiteralPath $file.FullName -Force
+    }
+
+    foreach ($fileName in ($expectedFiles.Keys | Sort-Object)) {
+        $filePath = Join-Path $script:RootDirectory $fileName
+        Set-Content -LiteralPath $filePath -Value $expectedFiles[$fileName] -Encoding ASCII
+    }
+
+    return $true
 }
 
 function Get-Config {
@@ -557,7 +690,9 @@ function Get-Config {
     Validate-Config -Config $config
     $wasReformatted = Write-FormattedConfigIfNeeded -Path $script:ConfigPath -FormattedText (ConvertTo-ConfigText -Config $config)
     if ($wasReformatted) {
+        [void](Sync-LayoutShortcutScripts -Config $config)
         Add-PendingMessage -Message "Reformatted and saved '$script:ConfigPath'."
+        Add-PendingMessage -Message "Updated layout shortcut scripts in '$script:RootDirectory'."
     }
     return $config
 }
@@ -1152,6 +1287,7 @@ function Show-Menu {
                 Write-Host ''
                 Write-Host ("Applied layout '{0}'. Press Enter to continue." -f $selected.Label)
                 Write-Host ('Tip: you can create a shortcut script containing: WindowLayout.cmd -ApplyLayout "{0}"' -f $selected.Label)
+                Write-Host ('Shortcut script available: "WindowLayout - {0}.cmd" in "{1}".' -f (ConvertTo-ShortcutFileName -Name $selected.Label), $script:RootDirectory)
                 [void][Console]::ReadLine()
             }
             else {

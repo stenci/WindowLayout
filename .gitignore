@@ -2,3 +2,4 @@ dist/
 build/
 WindowLayout/current_layout.txt
 WindowLayout/window_layouts.txt
+WindowLayout/*.cmd
