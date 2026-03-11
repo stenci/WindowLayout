@@ -11,17 +11,19 @@ $ErrorActionPreference = 'Stop'
 $script:RootDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 $script:ConfigPath = Join-Path $script:RootDirectory 'window_layouts.txt'
 $script:CurrentLayoutPath = Join-Path $script:RootDirectory 'current_layout.txt'
-$script:HorizontalGap = 7
-$script:VerticalGap = 6
+$script:IgnoredProcessesPath = Join-Path $script:RootDirectory 'processes_to_ignore.txt'
 $script:PendingMessages = @()
 
 Add-Type -AssemblyName System.Windows.Forms
+[System.Threading.Thread]::CurrentThread.CurrentCulture = [System.Globalization.CultureInfo]::InvariantCulture
+[System.Threading.Thread]::CurrentThread.CurrentUICulture = [System.Globalization.CultureInfo]::InvariantCulture
 
 $nativeSource = @"
 using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Threading;
 using System.Text;
 
 public static class WindowLayoutNative
@@ -124,7 +126,69 @@ public interface IVirtualDesktopManager
     int GetWindowDesktopId(IntPtr topLevelWindow, out Guid desktopId);
 
     [PreserveSig]
-    int MoveWindowToDesktop(IntPtr topLevelWindow, [MarshalAs(UnmanagedType.LPStruct)] Guid desktopId);
+    int MoveWindowToDesktop(IntPtr topLevelWindow, ref Guid desktopId);
+}
+
+[ComImport]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+[Guid("372E1D3B-38D3-42E4-A15B-8AB2B178F513")]
+public interface IApplicationView
+{
+}
+
+[ComImport]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+[Guid("1841C6D7-4F9D-42C0-AF41-8747538F10E5")]
+public interface IApplicationViewCollection
+{
+    int GetViews(out IObjectArray array);
+    int GetViewsByZOrder(out IObjectArray array);
+    int GetViewsByAppUserModelId(string id, out IObjectArray array);
+    int GetViewForHwnd(IntPtr hwnd, out IApplicationView view);
+}
+
+[ComImport]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+[Guid("FF72FFDD-BE7E-43FC-9C03-AD81681E88E4")]
+public interface IVirtualDesktop
+{
+    bool IsViewVisible(IApplicationView view);
+    Guid GetId();
+}
+
+[ComImport]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+[Guid("F31574D6-B682-4CDC-BD56-1827860ABEC6")]
+public interface IVirtualDesktopManagerInternal
+{
+    int GetCount();
+    void MoveViewToDesktop(IApplicationView view, IVirtualDesktop desktop);
+    bool CanViewMoveDesktops(IApplicationView view);
+    IVirtualDesktop GetCurrentDesktop();
+    void GetDesktops(out IObjectArray desktops);
+    int GetAdjacentDesktop(IVirtualDesktop from, int direction, out IVirtualDesktop desktop);
+    void SwitchDesktop(IVirtualDesktop desktop);
+    IVirtualDesktop CreateDesktop();
+    void RemoveDesktop(IVirtualDesktop desktop, IVirtualDesktop fallback);
+    IVirtualDesktop FindDesktop(ref Guid desktopId);
+}
+
+[ComImport]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+[Guid("92CA9DCD-5622-4BBA-A805-5E9F541BD8C9")]
+public interface IObjectArray
+{
+    void GetCount(out int count);
+    void GetAt(int index, ref Guid iid, [MarshalAs(UnmanagedType.Interface)] out object obj);
+}
+
+[ComImport]
+[InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+[Guid("6D5140C1-7436-11CE-8034-00AA006009FA")]
+public interface IServiceProvider10
+{
+    [return: MarshalAs(UnmanagedType.IUnknown)]
+    object QueryService(ref Guid service, ref Guid riid);
 }
 
 [ComImport]
@@ -135,8 +199,23 @@ public class VirtualDesktopManagerCom
 
 public static class VirtualDesktopHelper
 {
+    private static readonly Guid CLSID_ImmersiveShell = new Guid("C2F03A33-21F5-47FA-B4BB-156362A2F239");
+    private static readonly Guid CLSID_VirtualDesktopManagerInternal = new Guid("C5E0CDCA-7B6E-41B2-9FC4-D93975CC467B");
     private static readonly Lazy<IVirtualDesktopManager> _manager = new Lazy<IVirtualDesktopManager>(() =>
         (IVirtualDesktopManager)new VirtualDesktopManagerCom(), LazyThreadSafetyMode.ExecutionAndPublication);
+    private static readonly Lazy<IVirtualDesktopManagerInternal> _internalManager = new Lazy<IVirtualDesktopManagerInternal>(() =>
+    {
+        IServiceProvider10 shell = (IServiceProvider10)Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_ImmersiveShell));
+        Guid service = CLSID_VirtualDesktopManagerInternal;
+        Guid iid = typeof(IVirtualDesktopManagerInternal).GUID;
+        return (IVirtualDesktopManagerInternal)shell.QueryService(ref service, ref iid);
+    }, LazyThreadSafetyMode.ExecutionAndPublication);
+    private static readonly Lazy<IApplicationViewCollection> _viewCollection = new Lazy<IApplicationViewCollection>(() =>
+    {
+        IServiceProvider10 shell = (IServiceProvider10)Activator.CreateInstance(Type.GetTypeFromCLSID(CLSID_ImmersiveShell));
+        Guid iid = typeof(IApplicationViewCollection).GUID;
+        return (IApplicationViewCollection)shell.QueryService(ref iid, ref iid);
+    }, LazyThreadSafetyMode.ExecutionAndPublication);
 
     public static Guid? GetWindowDesktopId(IntPtr hWnd)
     {
@@ -161,11 +240,69 @@ public static class VirtualDesktopHelper
     {
         try
         {
-            return _manager.Value.MoveWindowToDesktop(hWnd, desktopId) == 0;
+            return MoveWindowToDesktopWithResult(hWnd, desktopId) == 0;
         }
         catch
         {
             return false;
+        }
+    }
+
+    public static int MoveWindowToDesktopWithResult(IntPtr hWnd, Guid desktopId)
+    {
+        try
+        {
+            IApplicationView view;
+            int hr = _viewCollection.Value.GetViewForHwnd(hWnd, out view);
+            if (hr != 0 || view == null)
+            {
+                return hr != 0 ? hr : unchecked((int)0x80004005);
+            }
+
+            IVirtualDesktop desktop = _internalManager.Value.FindDesktop(ref desktopId);
+            if (desktop == null)
+            {
+                return unchecked((int)0x80070057);
+            }
+
+            _internalManager.Value.MoveViewToDesktop(view, desktop);
+            return 0;
+        }
+        catch (COMException ex)
+        {
+            return ex.HResult;
+        }
+        catch
+        {
+            return unchecked((int)0x80004005);
+        }
+    }
+
+    public static string[] GetDesktopIds()
+    {
+        try
+        {
+            IObjectArray desktops;
+            _internalManager.Value.GetDesktops(out desktops);
+            int count;
+            desktops.GetCount(out count);
+            List<string> ids = new List<string>(count);
+            Guid iid = typeof(IVirtualDesktop).GUID;
+            for (int i = 0; i < count; i++)
+            {
+                object desktopObject;
+                desktops.GetAt(i, ref iid, out desktopObject);
+                IVirtualDesktop desktop = (IVirtualDesktop)desktopObject;
+                ids.Add(desktop.GetId().ToString("D").ToLowerInvariant());
+                Marshal.ReleaseComObject(desktopObject);
+            }
+
+            Marshal.ReleaseComObject(desktops);
+            return ids.ToArray();
+        }
+        catch
+        {
+            return new string[0];
         }
     }
 }
@@ -186,6 +323,91 @@ function Add-PendingMessage {
     param([Parameter(Mandatory = $true)][string]$Message)
 
     $script:PendingMessages += $Message
+}
+
+function Get-IgnoredProcesses {
+    $map = @{}
+    if (-not (Test-Path -LiteralPath $script:IgnoredProcessesPath)) {
+        return $map
+    }
+
+    foreach ($line in (Get-Content -LiteralPath $script:IgnoredProcessesPath -Encoding UTF8)) {
+        $name = $line.Trim()
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        if ($name.StartsWith('#')) {
+            continue
+        }
+
+        $map[$name.ToLowerInvariant()] = $true
+    }
+
+    return $map
+}
+
+function Save-IgnoredProcesses {
+    param([Parameter(Mandatory = $true)]$IgnoredProcesses)
+
+    $names = @($IgnoredProcesses.Keys | Sort-Object)
+    $lines = @(
+        '# Processes whose windows did not appear on real virtual desktops during a full scan.',
+        '# Delete a line if you want the script to try that process again.',
+        ''
+    ) + $names
+
+    Set-Content -LiteralPath $script:IgnoredProcessesPath -Value $lines -Encoding UTF8
+}
+
+function Update-IgnoredProcessesFromObservations {
+    param(
+        [Parameter(Mandatory = $true)]$ExistingIgnored,
+        [Parameter(Mandatory = $true)]$Observations
+    )
+
+    $updated = @{}
+    foreach ($key in $ExistingIgnored.Keys) {
+        $updated[$key] = $true
+    }
+
+    foreach ($entry in $Observations.GetEnumerator()) {
+        $processName = $entry.Key
+        $stats = $entry.Value
+        if ($stats.RealDesktopCount -gt 0) {
+            if ($updated.ContainsKey($processName)) {
+                $updated.Remove($processName)
+            }
+            continue
+        }
+
+        if ($stats.UnknownDesktopCount -gt 0) {
+            $updated[$processName] = $true
+        }
+    }
+
+    Save-IgnoredProcesses -IgnoredProcesses $updated
+    return $updated
+}
+
+function Add-IgnoredProcesses {
+    param([string[]]$ProcessNames)
+
+    if ($null -eq $ProcessNames -or $ProcessNames.Count -eq 0) {
+        return Get-IgnoredProcesses
+    }
+
+    $updated = Get-IgnoredProcesses
+    foreach ($name in $ProcessNames) {
+        if ([string]::IsNullOrWhiteSpace($name)) {
+            continue
+        }
+
+        $updated[$name.Trim().ToLowerInvariant()] = $true
+    }
+
+    Save-IgnoredProcesses -IgnoredProcesses $updated
+    return $updated
 }
 
 function Show-PendingMessages {
@@ -295,6 +517,113 @@ function Parse-YesNo {
     }
 }
 
+function Parse-DesktopNumber {
+    param([string]$Value)
+
+    $text = if ($null -eq $Value) { '' } else { $Value.Trim() }
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return $null
+    }
+
+    $number = 0
+    if (-not [int]::TryParse($text, [ref]$number) -or $number -lt 1) {
+        throw "Desktop value '$Value' must be blank or a positive whole number."
+    }
+
+    return $number
+}
+
+function Parse-LayoutNumber {
+    param([string]$Value)
+
+    $text = if ($null -eq $Value) { '' } else { $Value.Trim() }
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        throw 'Layout numeric values cannot be blank.'
+    }
+
+    $number = 0.0
+    if (-not [double]::TryParse($text, [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+        throw "Invalid numeric value '$Value'."
+    }
+
+    return $number
+}
+
+function Format-LayoutNumber {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    if ($Value -is [double] -or $Value -is [float] -or $Value -is [decimal]) {
+        return ([double]$Value).ToString('0.###############', [System.Globalization.CultureInfo]::InvariantCulture)
+    }
+
+    return [string]$Value
+}
+
+function Get-NormalizedDesktopId {
+    param($Value)
+
+    if ($null -eq $Value) {
+        return ''
+    }
+
+    if ($Value -is [guid]) {
+        return $Value.ToString('D').ToLowerInvariant()
+    }
+
+    $text = [string]$Value
+    if ([string]::IsNullOrWhiteSpace($text)) {
+        return ''
+    }
+
+    $guid = [guid]::Empty
+    if ([guid]::TryParse($text, [ref]$guid)) {
+        return $guid.ToString('D').ToLowerInvariant()
+    }
+
+    return $text.Trim().ToLowerInvariant()
+}
+
+function ConvertTo-WindowColumns {
+    param([Parameter(Mandatory = $true)][string]$Line)
+
+    $parts = @($Line -split '\|')
+    $trimmed = @($parts | ForEach-Object { $_.Trim() })
+    if ($trimmed.Count -lt 9) {
+        throw "Invalid window row: '$Line'"
+    }
+
+    $candidateTailLengths = @(8, 7)
+    foreach ($tailLength in $candidateTailLengths) {
+        if ($trimmed.Count -lt ($tailLength + 2)) {
+            continue
+        }
+
+        $tailStart = $trimmed.Count - $tailLength
+        if ($tailStart -lt 2) {
+            continue
+        }
+
+        $title = ($trimmed[1..($tailStart - 1)] -join '|').Trim()
+        $candidate = @($trimmed[0], $title)
+        $candidate += $trimmed[$tailStart..($trimmed.Count - 1)]
+
+        $matchValue = $candidate[2].ToLowerInvariant()
+        $cascadeValue = $candidate[8].ToLowerInvariant()
+        $desktopValue = if ($candidate.Count -ge 10) { $candidate[9] } else { '' }
+        $desktopIsValid = ($candidate.Count -lt 10) -or [string]::IsNullOrWhiteSpace($desktopValue) -or ($desktopValue -match '^\d+$') -or ($desktopValue.ToLowerInvariant() -eq 'desktop')
+
+        if (($matchValue -in @('contains', 'exact', 'regex', 'match')) -and ($cascadeValue -in @('yes', 'no', 'true', 'false', '1', '0', 'cascade')) -and $desktopIsValid) {
+            return ,$candidate
+        }
+    }
+
+    throw "Invalid window row: '$Line'"
+}
+
 function ConvertTo-ConfigFromText {
     param([string]$Text)
 
@@ -373,8 +702,12 @@ function ConvertTo-ConfigFromText {
                     continue
                 }
 
-                $columns = Split-TableLine -Line $line -AllowPipeInTitle
+                $columns = ConvertTo-WindowColumns -Line $line
                 if (Test-HeaderRow -Columns $columns -Expected @('processName', 'title', 'match', 'x', 'y', 'w', 'h', 'monitorRole', 'cascade')) {
+                    continue
+                }
+
+                if (Test-HeaderRow -Columns $columns -Expected @('processName', 'title', 'match', 'x', 'y', 'w', 'h', 'monitorRole', 'cascade', 'desktop')) {
                     continue
                 }
 
@@ -387,12 +720,13 @@ function ConvertTo-ConfigFromText {
                     processName = $columns[0]
                     title       = $columns[1]
                     titleMatch  = if ([string]::IsNullOrWhiteSpace($columns[2])) { 'contains' } else { $columns[2] }
-                    x           = [int]$columns[3]
-                    y           = [int]$columns[4]
-                    w           = [int]$columns[5]
-                    h           = [int]$columns[6]
+                    x           = Parse-LayoutNumber -Value $columns[3]
+                    y           = Parse-LayoutNumber -Value $columns[4]
+                    w           = Parse-LayoutNumber -Value $columns[5]
+                    h           = Parse-LayoutNumber -Value $columns[6]
                     monitorRole = $columns[7]
                     cascade     = Parse-YesNo -Value $columns[8]
+                    desktop     = if ($columns.Count -ge 10) { Parse-DesktopNumber -Value $columns[9] } else { $null }
                 }
                 continue
             }
@@ -503,16 +837,17 @@ function ConvertTo-ConfigText {
                     [string](Get-OptionalPropertyValue -Object $window -Name 'processName' -Default ''),
                     [string](Get-OptionalPropertyValue -Object $window -Name 'title' -Default ''),
                     [string](Get-OptionalPropertyValue -Object $window -Name 'titleMatch' -Default 'contains'),
-                    [string](Get-OptionalPropertyValue -Object $window -Name 'x' -Default 0),
-                    [string](Get-OptionalPropertyValue -Object $window -Name 'y' -Default 0),
-                    [string](Get-OptionalPropertyValue -Object $window -Name 'w' -Default 100),
-                    [string](Get-OptionalPropertyValue -Object $window -Name 'h' -Default 100),
+                    (Format-LayoutNumber (Get-OptionalPropertyValue -Object $window -Name 'x' -Default 0)),
+                    (Format-LayoutNumber (Get-OptionalPropertyValue -Object $window -Name 'y' -Default 0)),
+                    (Format-LayoutNumber (Get-OptionalPropertyValue -Object $window -Name 'w' -Default 100)),
+                    (Format-LayoutNumber (Get-OptionalPropertyValue -Object $window -Name 'h' -Default 100)),
                     [string](Get-OptionalPropertyValue -Object $window -Name 'monitorRole' -Default ''),
-                    $(if ([bool](Get-OptionalPropertyValue -Object $window -Name 'cascade' -Default $false)) { 'yes' } else { 'no' })
+                    $(if ([bool](Get-OptionalPropertyValue -Object $window -Name 'cascade' -Default $false)) { 'yes' } else { 'no' }),
+                    [string](Get-OptionalPropertyValue -Object $window -Name 'desktop' -Default '')
                 )
             }
         }
-        $lines += Format-Table -Headers @('processName', 'title', 'match', 'x', 'y', 'w', 'h', 'monitorRole', 'cascade') -Rows $rows
+        $lines += Format-Table -Headers @('processName', 'title', 'match', 'x', 'y', 'w', 'h', 'monitorRole', 'cascade', 'desktop') -Rows $rows
     }
 
     if ($lines.Count -eq 0) {
@@ -600,6 +935,11 @@ function Validate-Config {
             }
             elseif (-not $roleNames.ContainsKey($role)) {
                 $errors.Add("Layout '$($layout.name)' references unknown monitor role '$role' for monitor setup '$($layout.monitorSetup)'.")
+            }
+
+            $desktop = Get-OptionalPropertyValue -Object $window -Name 'desktop' -Default $null
+            if ($null -ne $desktop -and [int]$desktop -lt 1) {
+                $errors.Add("Layout '$($layout.name)' has invalid desktop '$desktop'.")
             }
         }
     }
@@ -695,6 +1035,184 @@ function Get-Config {
         Add-PendingMessage -Message "Updated layout shortcut scripts in '$script:RootDirectory'."
     }
     return $config
+}
+
+function ConvertTo-GuidList {
+    param([byte[]]$Bytes)
+
+    if ($null -eq $Bytes -or $Bytes.Length -lt 16) {
+        return @()
+    }
+
+    $guids = @()
+    for ($offset = 0; $offset -le ($Bytes.Length - 16); $offset += 16) {
+        $chunk = New-Object byte[] 16
+        [Array]::Copy($Bytes, $offset, $chunk, 0, 16)
+        $guids += ([guid]$chunk).ToString('D').ToLowerInvariant()
+    }
+
+    return $guids
+}
+
+function Get-VirtualDesktopIds {
+    return @([VirtualDesktopHelper]::GetDesktopIds())
+}
+
+function Get-WindowDesktopId {
+    param([IntPtr]$Handle)
+
+    $desktopId = [VirtualDesktopHelper]::GetWindowDesktopId($Handle)
+    if ($null -eq $desktopId) {
+        return ''
+    }
+
+    $valueProperty = $desktopId.PSObject.Properties['Value']
+    if ($null -ne $valueProperty) {
+        $normalizedValue = Get-NormalizedDesktopId -Value $valueProperty.Value
+        if ($normalizedValue -eq '00000000-0000-0000-0000-000000000000') {
+            return ''
+        }
+
+        return $normalizedValue
+    }
+
+    $normalized = Get-NormalizedDesktopId -Value $desktopId
+    if ($normalized -eq '00000000-0000-0000-0000-000000000000') {
+        return ''
+    }
+
+    return $normalized
+}
+
+function Get-DesktopOrdinalFromState {
+    param(
+        [AllowEmptyString()][string]$DesktopId,
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    $normalized = Get-NormalizedDesktopId -Value $DesktopId
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $null
+    }
+
+    if ($State.IndexById.ContainsKey($normalized)) {
+        return $State.IndexById[$normalized]
+    }
+
+    return $null
+}
+
+function New-VirtualDesktopState {
+    $orderedIds = New-Object System.Collections.Generic.List[string]
+    $indexById = @{}
+
+    foreach ($desktopId in @(Get-VirtualDesktopIds)) {
+        $normalized = Get-NormalizedDesktopId -Value $desktopId
+        if ([string]::IsNullOrWhiteSpace($normalized) -or $indexById.ContainsKey($normalized)) {
+            continue
+        }
+
+        $orderedIds.Add($normalized)
+        $indexById[$normalized] = $orderedIds.Count
+    }
+
+    return [pscustomobject]@{
+        OrderedIds = $orderedIds
+        IndexById  = $indexById
+    }
+}
+
+function Resolve-VirtualDesktopId {
+    param(
+        [int]$DesktopNumber,
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    if ($DesktopNumber -lt 1 -or $DesktopNumber -gt $State.OrderedIds.Count) {
+        return ''
+    }
+
+    return $State.OrderedIds[$DesktopNumber - 1]
+}
+
+function Test-IsRealDesktopId {
+    param(
+        [string]$DesktopId,
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    $normalized = Get-NormalizedDesktopId -Value $DesktopId
+    if ([string]::IsNullOrWhiteSpace($normalized)) {
+        return $false
+    }
+
+    return $State.IndexById.ContainsKey($normalized)
+}
+
+function Move-WindowToVirtualDesktopNumber {
+    param(
+        [Parameter(Mandatory = $true)]$Window,
+        [int]$DesktopNumber,
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    if ($DesktopNumber -lt 1) {
+        return $false
+    }
+
+    $desktopIdText = Resolve-VirtualDesktopId -DesktopNumber $DesktopNumber -State $State
+    if ([string]::IsNullOrWhiteSpace($desktopIdText)) {
+        return $false
+    }
+
+    $desktopId = [guid]::Empty
+    if (-not [guid]::TryParse($desktopIdText, [ref]$desktopId)) {
+        return $false
+    }
+
+    $result = [VirtualDesktopHelper]::MoveWindowToDesktopWithResult($Window.Handle, $desktopId)
+    if ($result -ne 0) {
+        return $false
+    }
+
+    return $true
+}
+
+function Test-WindowOnVirtualDesktopNumber {
+    param(
+        [Parameter(Mandatory = $true)]$Window,
+        [int]$DesktopNumber,
+        [Parameter(Mandatory = $true)]$State
+    )
+
+    if ($DesktopNumber -lt 1) {
+        return $true
+    }
+
+    $targetDesktopId = Resolve-VirtualDesktopId -DesktopNumber $DesktopNumber -State $State
+    if ([string]::IsNullOrWhiteSpace($targetDesktopId)) {
+        return $false
+    }
+
+    $currentDesktopId = Ensure-WindowDesktopId -Window $Window
+    if ([string]::IsNullOrWhiteSpace($currentDesktopId)) {
+        return $false
+    }
+
+    return $currentDesktopId -eq $targetDesktopId
+}
+
+function Ensure-WindowDesktopId {
+    param([Parameter(Mandatory = $true)]$Window)
+
+    $currentDesktopId = Get-NormalizedDesktopId -Value (Get-OptionalPropertyValue -Object $Window -Name 'DesktopId' -Default '')
+    if (-not [string]::IsNullOrWhiteSpace($currentDesktopId)) {
+        return $currentDesktopId
+    }
+
+    $resolvedDesktopId = Get-WindowDesktopId -Handle $Window.Handle
+    $Window | Add-Member -NotePropertyName DesktopId -NotePropertyValue $resolvedDesktopId -Force
+    return $resolvedDesktopId
 }
 
 function Get-ActualMonitors {
@@ -809,7 +1327,10 @@ function Get-MonitorMapping {
 }
 
 function Get-WindowProcessName {
-    param([IntPtr]$Handle)
+    param(
+        [IntPtr]$Handle,
+        [hashtable]$Cache
+    )
 
     $processId = [uint32]0
     [void][WindowLayoutNative]::GetWindowThreadProcessId($Handle, [ref]$processId)
@@ -817,12 +1338,23 @@ function Get-WindowProcessName {
         return $null
     }
 
+    if ($null -ne $Cache -and $Cache.ContainsKey($processId)) {
+        return $Cache[$processId]
+    }
+
+    $processName = $null
     try {
-        return (Get-Process -Id $processId -ErrorAction Stop).ProcessName + '.exe'
+        $processName = (Get-Process -Id $processId -ErrorAction Stop).ProcessName + '.exe'
     }
     catch {
-        return $null
+        $processName = $null
     }
+
+    if ($null -ne $Cache) {
+        $Cache[$processId] = $processName
+    }
+
+    return $processName
 }
 
 function Get-WindowRectObject {
@@ -844,10 +1376,28 @@ function Get-WindowRectObject {
 }
 
 function Get-OpenWindows {
-    $skipClasses = @('Progman', 'WorkerW', 'Shell_TrayWnd')
+    param(
+        [bool]$IncludeDesktopId = $true
+    )
 
-    foreach ($handle in [WindowLayoutNative]::GetTopLevelWindows()) {
-        if (-not [WindowLayoutNative]::IsWindowVisible($handle)) {
+    $skipClasses = @('Progman', 'WorkerW', 'Shell_TrayWnd')
+    $ignoredProcesses = Get-IgnoredProcesses
+    $observations = @{}
+    $desktopState = if ($IncludeDesktopId) { New-VirtualDesktopState } else { $null }
+    $handles = [WindowLayoutNative]::GetTopLevelWindows()
+    $processNameCache = @{}
+    $current = 0
+    $result = New-Object System.Collections.Generic.List[object]
+
+    foreach ($handle in $handles) {
+        $current++
+        $processName = Get-WindowProcessName -Handle $handle -Cache $processNameCache
+        if ([string]::IsNullOrWhiteSpace($processName)) {
+            continue
+        }
+
+        $processKey = $processName.ToLowerInvariant()
+        if ($ignoredProcesses.ContainsKey($processKey)) {
             continue
         }
 
@@ -861,24 +1411,55 @@ function Get-OpenWindows {
             continue
         }
 
-        $processName = Get-WindowProcessName -Handle $handle
-        if ([string]::IsNullOrWhiteSpace($processName)) {
-            continue
-        }
-
         $rect = Get-WindowRectObject -Handle $handle
         if ($null -eq $rect -or $rect.Width -le 0 -or $rect.Height -le 0) {
             continue
         }
 
-        [pscustomobject]@{
+        $isVisible = [WindowLayoutNative]::IsWindowVisible($handle)
+        $isCloaked = [WindowLayoutNative]::GetWindowCloakedValue($handle) -ne 0
+        if (-not $isVisible -and -not $isCloaked) {
+            continue
+        }
+
+        $desktopId = ''
+        if ($IncludeDesktopId) {
+            $desktopId = Get-WindowDesktopId -Handle $handle
+
+            if (-not $observations.ContainsKey($processKey)) {
+                $observations[$processKey] = [pscustomobject]@{
+                    ProcessName        = $processName
+                    RealDesktopCount   = 0
+                    UnknownDesktopCount = 0
+                }
+            }
+
+            if (-not (Test-IsRealDesktopId -DesktopId $desktopId -State $desktopState)) {
+                $observations[$processKey].UnknownDesktopCount++
+            }
+            else {
+                $observations[$processKey].RealDesktopCount++
+            }
+        }
+
+        $window = [pscustomobject]@{
             Handle      = $handle
             Title       = $title
             ProcessName = $processName
             Rect        = $rect
             IsMinimized = [WindowLayoutNative]::IsIconic($handle)
+            DesktopId   = $desktopId
         }
+
+        $result.Add($window)
+
     }
+
+    if ($IncludeDesktopId) {
+        $ignoredProcesses = Update-IgnoredProcessesFromObservations -ExistingIgnored $ignoredProcesses -Observations $observations
+    }
+
+    return @($result.ToArray() | Where-Object { -not $ignoredProcesses.ContainsKey($_.ProcessName.ToLowerInvariant()) })
 }
 
 function Test-TitleMatch {
@@ -943,20 +1524,20 @@ function Move-WindowToLayout {
         [int]$OffsetY = 0
     )
 
-    $xPct = [int](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'x' -Default 0)
-    $yPct = [int](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'y' -Default 0)
-    $wPct = [int](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'w' -Default 100)
-    $hPct = [int](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'h' -Default 100)
+    $xPct = [double](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'x' -Default 0)
+    $yPct = [double](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'y' -Default 0)
+    $wPct = [double](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'w' -Default 100)
+    $hPct = [double](Get-OptionalPropertyValue -Object $WindowDefinition -Name 'h' -Default 100)
 
-    $left = $Monitor.X + [Math]::Floor($Monitor.Width * $xPct / 100)
-    $top = $Monitor.Y + [Math]::Floor($Monitor.Height * $yPct / 100)
-    $right = $Monitor.X + [Math]::Floor($Monitor.Width * ($xPct + $wPct) / 100)
-    $bottom = $Monitor.Y + [Math]::Floor($Monitor.Height * ($yPct + $hPct) / 100)
+    $left = $Monitor.X + [int][Math]::Round($Monitor.Width * $xPct / 100.0, 0)
+    $top = $Monitor.Y + [int][Math]::Round($Monitor.Height * $yPct / 100.0, 0)
+    $right = $Monitor.X + [int][Math]::Round($Monitor.Width * ($xPct + $wPct) / 100.0, 0)
+    $bottom = $Monitor.Y + [int][Math]::Round($Monitor.Height * ($yPct + $hPct) / 100.0, 0)
 
-    $x = $left - $script:HorizontalGap + $OffsetX
-    $y = $top - $script:VerticalGap + $OffsetY
-    $width = ($right - $left) + ($script:HorizontalGap * 2)
-    $height = ($bottom - $top) + ($script:VerticalGap * 2)
+    $x = $left + $OffsetX
+    $y = $top + $OffsetY
+    $width = $right - $left
+    $height = $bottom - $top
 
     [void][WindowLayoutNative]::ShowWindowAsync($Window.Handle, 9)
     [void][WindowLayoutNative]::MoveWindow($Window.Handle, $x, $y, $width, $height, $true)
@@ -987,7 +1568,8 @@ function Apply-Layout {
     }
 
     $mapping = Get-MonitorMapping -MonitorSetup $setup -ActualMonitors (Get-ActualMonitors)
-    $availableWindows = @(Get-OpenWindows)
+    $availableWindows = @(Get-OpenWindows -IncludeDesktopId $false)
+    $desktopState = New-VirtualDesktopState
 
     foreach ($windowDefinition in $Layout.windows) {
         if (Get-OptionalPropertyValue -Object $windowDefinition -Name 'rawLine' -Default '') {
@@ -1006,9 +1588,18 @@ function Apply-Layout {
         foreach ($window in $matches) {
             $offsetX = 0
             $offsetY = 0
+            $desktopNumber = Get-OptionalPropertyValue -Object $windowDefinition -Name 'desktop' -Default $null
             if ([bool](Get-OptionalPropertyValue -Object $windowDefinition -Name 'cascade' -Default $false) -and $matches.Count -gt 1) {
                 $offsetX = $cascadeOffset * $index
                 $offsetY = -1 * $cascadeOffset * $index
+            }
+
+            if ($null -ne $desktopNumber) {
+                if (-not (Test-WindowOnVirtualDesktopNumber -Window $window -DesktopNumber ([int]$desktopNumber) -State $desktopState)) {
+                    if (Move-WindowToVirtualDesktopNumber -Window $window -DesktopNumber ([int]$desktopNumber) -State $desktopState) {
+                        $window.DesktopId = Resolve-VirtualDesktopId -DesktopNumber ([int]$desktopNumber) -State $desktopState
+                    }
+                }
             }
 
             Move-WindowToLayout -Window $window -WindowDefinition $windowDefinition -Monitor $monitor -OffsetX $offsetX -OffsetY $offsetY
@@ -1177,6 +1768,7 @@ function Capture-CurrentLayout {
     $actualMonitors = @(Get-ActualMonitors)
     $mapping = Get-MonitorMapping -MonitorSetup $CaptureTarget.setup -ActualMonitors $actualMonitors
     $windows = @(Get-OpenWindows | Where-Object { -not $_.IsMinimized } | Sort-Object ProcessName, Title)
+    $desktopState = New-VirtualDesktopState
 
     $capturedRows = foreach ($window in $windows) {
         $actualMonitor = Get-MonitorForWindow -Window $window -ActualMonitors $actualMonitors
@@ -1188,22 +1780,31 @@ function Capture-CurrentLayout {
             }
         }
 
-        $innerLeft = $window.Rect.Left + $script:HorizontalGap
-        $innerTop = $window.Rect.Top + $script:VerticalGap
-        $innerRight = $window.Rect.Right - $script:HorizontalGap
-        $innerBottom = $window.Rect.Bottom - $script:VerticalGap
-
         [pscustomobject]@{
             processName = $window.ProcessName
             title       = $window.Title
             titleMatch  = 'contains'
-            x           = Get-Percent -Value $innerLeft -Minimum $actualMonitor.X -Maximum ($actualMonitor.X + $actualMonitor.Width)
-            y           = Get-Percent -Value $innerTop -Minimum $actualMonitor.Y -Maximum ($actualMonitor.Y + $actualMonitor.Height)
-            w           = Get-SizePercent -Size ($innerRight - $innerLeft) -TotalSize $actualMonitor.Width
-            h           = Get-SizePercent -Size ($innerBottom - $innerTop) -TotalSize $actualMonitor.Height
+            x           = Get-Percent -Value $window.Rect.Left -Minimum $actualMonitor.X -Maximum ($actualMonitor.X + $actualMonitor.Width)
+            y           = Get-Percent -Value $window.Rect.Top -Minimum $actualMonitor.Y -Maximum ($actualMonitor.Y + $actualMonitor.Height)
+            w           = Get-SizePercent -Size $window.Rect.Width -TotalSize $actualMonitor.Width
+            h           = Get-SizePercent -Size $window.Rect.Height -TotalSize $actualMonitor.Height
             monitorRole = $monitorRole
             cascade     = $false
+            desktop     = Get-DesktopOrdinalFromState -DesktopId $window.DesktopId -State $desktopState
         }
+    }
+
+    $processesWithBlankDesktop = @(
+        $capturedRows |
+            Where-Object { $null -eq $_.desktop } |
+            ForEach-Object { $_.processName } |
+            Sort-Object -Unique
+    )
+
+    if ($processesWithBlankDesktop.Count -gt 0) {
+        [void](Add-IgnoredProcesses -ProcessNames $processesWithBlankDesktop)
+        $capturedRows = @($capturedRows | Where-Object { $processesWithBlankDesktop -notcontains $_.processName })
+        Add-PendingMessage ("Ignored processes with no usable desktop: {0}" -f ($processesWithBlankDesktop -join ', '))
     }
 
     $layoutWindows = @()
@@ -1221,6 +1822,7 @@ function Capture-CurrentLayout {
                 h           = $first.h
                 monitorRole = $first.monitorRole
                 cascade     = $true
+                desktop     = $first.desktop
             }
         }
 
