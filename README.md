@@ -145,6 +145,7 @@ That shows a useful pattern:
 
 - Capture learns ignored processes automatically and stores them in `WindowLayout\processes_to_ignore.txt`
 - Processes without a valid desktop number are blacklisted and omitted from `current_layout.txt`
+- `WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist` captures the full visible window list for troubleshooting, including blacklisted processes and windows without a usable desktop number
 - Capture still writes integer percentages, but manual decimal edits in `window_layouts.txt` are preserved when the file is reformatted
 
 ## Restore Notes
@@ -160,8 +161,11 @@ That shows a useful pattern:
 WindowLayout.cmd
 WindowLayout.cmd -ListLayouts
 WindowLayout.cmd -CaptureCurrent
+WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist
 WindowLayout.cmd -ApplyLayout "3 monitors - developer"
 ```
+
+When you run `-CaptureCurrent` from the command line, the script automatically picks the best saved monitor setup that matches the currently detected monitors.
 
 ## License
 

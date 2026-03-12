@@ -31,6 +31,7 @@ How to use it
 5. After capture, open current_layout.txt, copy the monitor setup or layout you want into window_layouts.txt, and remove the rows you do not need.
 6. Capture usually includes more windows than you want, including helper windows and some windows that are not obvious at first glance.
 7. Processes without a valid desktop number are added to processes_to_ignore.txt instead of being written to current_layout.txt.
+8. For troubleshooting, run WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist to capture the full visible window list, including blacklisted processes and windows with no usable desktop number.
 
 Direct shortcut script
 - You can also run a layout directly from the command line:
@@ -104,6 +105,7 @@ Capture behavior
 - The monitor match is tolerant: it does not require a perfect coordinate or size match.
 - Capture records the virtual desktop number for each included window.
 - Processes without a valid desktop number are added to processes_to_ignore.txt and left out of current_layout.txt.
+- Running WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist bypasses that filter and keeps those rows in current_layout.txt with a blank desktop column.
 - For multi-instance applications, capture emits both:
   - one cascade row with an empty title
   - the individual per-window rows
@@ -130,4 +132,6 @@ Command line examples
 - WindowLayout.cmd
 - WindowLayout.cmd -ListLayouts
 - WindowLayout.cmd -CaptureCurrent
+- WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist
 - WindowLayout.cmd -ApplyLayout "3 monitors - developer"
+- Command-line capture automatically picks the best saved monitor setup that matches the currently detected monitors.

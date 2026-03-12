@@ -2,7 +2,8 @@
 param(
     [string]$ApplyLayout,
     [switch]$CaptureCurrent,
-    [switch]$ListLayouts
+    [switch]$ListLayouts,
+    [switch]$IgnoreBlacklist
 )
 
 Set-StrictMode -Version 3.0
@@ -363,7 +364,8 @@ function Save-IgnoredProcesses {
 function Update-IgnoredProcessesFromObservations {
     param(
         [Parameter(Mandatory = $true)]$ExistingIgnored,
-        [Parameter(Mandatory = $true)]$Observations
+        [Parameter(Mandatory = $true)]$Observations,
+        [hashtable]$ProtectedProcesses = @{}
     )
 
     $updated = @{}
@@ -371,9 +373,22 @@ function Update-IgnoredProcessesFromObservations {
         $updated[$key] = $true
     }
 
+    foreach ($key in $ProtectedProcesses.Keys) {
+        if ($updated.ContainsKey($key)) {
+            $updated.Remove($key)
+        }
+    }
+
     foreach ($entry in $Observations.GetEnumerator()) {
         $processName = $entry.Key
         $stats = $entry.Value
+        if ($ProtectedProcesses.ContainsKey($processName)) {
+            if ($updated.ContainsKey($processName)) {
+                $updated.Remove($processName)
+            }
+            continue
+        }
+
         if ($stats.RealDesktopCount -gt 0) {
             if ($updated.ContainsKey($processName)) {
                 $updated.Remove($processName)
@@ -408,6 +423,28 @@ function Add-IgnoredProcesses {
 
     Save-IgnoredProcesses -IgnoredProcesses $updated
     return $updated
+}
+
+function Get-ProtectedProcessesFromConfig {
+    param($Config)
+
+    $result = @{}
+    if ($null -eq $Config) {
+        return $result
+    }
+
+    foreach ($layout in @($Config.layouts)) {
+        foreach ($window in @($layout.windows)) {
+            $processName = [string](Get-OptionalPropertyValue -Object $window -Name 'processName' -Default '')
+            if ([string]::IsNullOrWhiteSpace($processName)) {
+                continue
+            }
+
+            $result[$processName.Trim().ToLowerInvariant()] = $true
+        }
+    }
+
+    return $result
 }
 
 function Show-PendingMessages {
@@ -1285,6 +1322,16 @@ function Get-MonitorMapping {
         [Parameter(Mandatory = $true)]$ActualMonitors
     )
 
+    $match = Get-MonitorSetupMatch -MonitorSetup $MonitorSetup -ActualMonitors $ActualMonitors
+    return $match.Mapping
+}
+
+function Get-MonitorSetupMatch {
+    param(
+        [Parameter(Mandatory = $true)]$MonitorSetup,
+        [Parameter(Mandatory = $true)]$ActualMonitors
+    )
+
     $expected = @($MonitorSetup.monitors)
     $actual = @($ActualMonitors)
     if ($expected.Count -ne $actual.Count) {
@@ -1323,7 +1370,11 @@ function Get-MonitorMapping {
         $mapping[[string]$expected[$i].role] = $actual[$bestPermutation[$i]]
     }
 
-    return $mapping
+    return [pscustomobject]@{
+        MonitorSetup = $MonitorSetup
+        Mapping      = $mapping
+        Cost         = $bestCost
+    }
 }
 
 function Get-WindowProcessName {
@@ -1377,11 +1428,13 @@ function Get-WindowRectObject {
 
 function Get-OpenWindows {
     param(
-        [bool]$IncludeDesktopId = $true
+        [bool]$IncludeDesktopId = $true,
+        [bool]$IgnoreBlacklist = $false,
+        [hashtable]$ProtectedProcesses = @{}
     )
 
     $skipClasses = @('Progman', 'WorkerW', 'Shell_TrayWnd')
-    $ignoredProcesses = Get-IgnoredProcesses
+    $ignoredProcesses = if ($IgnoreBlacklist) { @{} } else { Get-IgnoredProcesses }
     $observations = @{}
     $desktopState = if ($IncludeDesktopId) { New-VirtualDesktopState } else { $null }
     $handles = [WindowLayoutNative]::GetTopLevelWindows()
@@ -1397,7 +1450,8 @@ function Get-OpenWindows {
         }
 
         $processKey = $processName.ToLowerInvariant()
-        if ($ignoredProcesses.ContainsKey($processKey)) {
+        $isIgnoredProcess = $ignoredProcesses.ContainsKey($processKey) -and -not $ProtectedProcesses.ContainsKey($processKey)
+        if (-not $IncludeDesktopId -and $isIgnoredProcess) {
             continue
         }
 
@@ -1451,15 +1505,24 @@ function Get-OpenWindows {
             DesktopId   = $desktopId
         }
 
-        $result.Add($window)
+        if (-not $isIgnoredProcess) {
+            $result.Add($window)
+        }
 
     }
 
-    if ($IncludeDesktopId) {
-        $ignoredProcesses = Update-IgnoredProcessesFromObservations -ExistingIgnored $ignoredProcesses -Observations $observations
+    if ($IncludeDesktopId -and -not $IgnoreBlacklist) {
+        $ignoredProcesses = Update-IgnoredProcessesFromObservations -ExistingIgnored $ignoredProcesses -Observations $observations -ProtectedProcesses $ProtectedProcesses
     }
 
-    return @($result.ToArray() | Where-Object { -not $ignoredProcesses.ContainsKey($_.ProcessName.ToLowerInvariant()) })
+    if ($IgnoreBlacklist) {
+        return @($result.ToArray())
+    }
+
+    return @($result.ToArray() | Where-Object {
+        $processKey = $_.ProcessName.ToLowerInvariant()
+        (-not $ignoredProcesses.ContainsKey($processKey)) -or $ProtectedProcesses.ContainsKey($processKey)
+    })
 }
 
 function Test-TitleMatch {
@@ -1759,15 +1822,47 @@ function Select-MonitorSetupForCapture {
     }
 }
 
+function Resolve-CaptureTarget {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    $actualMonitors = @(Get-ActualMonitors)
+    if ($Config.monitorSetups.Count -eq 0) {
+        return Select-MonitorSetupForCapture -Config $Config
+    }
+
+    $matches = New-Object System.Collections.Generic.List[object]
+    foreach ($setup in $Config.monitorSetups) {
+        try {
+            $match = Get-MonitorSetupMatch -MonitorSetup $setup -ActualMonitors $actualMonitors
+            $matches.Add($match)
+        }
+        catch {
+        }
+    }
+
+    if ($matches.Count -eq 0) {
+        throw "No saved monitor setup matches the currently detected monitors. Run interactive capture to choose or create a monitor setup."
+    }
+
+    $bestMatch = @($matches | Sort-Object Cost, @{ Expression = { $_.MonitorSetup.name } })[0]
+    Add-PendingMessage ("Using monitor setup '{0}' for capture." -f $bestMatch.MonitorSetup.name)
+    return [pscustomobject]@{
+        setup = $bestMatch.MonitorSetup
+        isNew = $false
+    }
+}
+
 function Capture-CurrentLayout {
     param(
         [Parameter(Mandatory = $true)]$Config,
-        [Parameter(Mandatory = $true)]$CaptureTarget
+        [Parameter(Mandatory = $true)]$CaptureTarget,
+        [bool]$IgnoreBlacklist = $false
     )
 
     $actualMonitors = @(Get-ActualMonitors)
     $mapping = Get-MonitorMapping -MonitorSetup $CaptureTarget.setup -ActualMonitors $actualMonitors
-    $windows = @(Get-OpenWindows | Where-Object { -not $_.IsMinimized } | Sort-Object ProcessName, Title)
+    $protectedProcesses = Get-ProtectedProcessesFromConfig -Config $Config
+    $windows = @(Get-OpenWindows -IgnoreBlacklist:$IgnoreBlacklist -ProtectedProcesses $protectedProcesses | Where-Object { -not $_.IsMinimized } | Sort-Object ProcessName, Title)
     $desktopState = New-VirtualDesktopState
 
     $capturedRows = foreach ($window in $windows) {
@@ -1796,15 +1891,24 @@ function Capture-CurrentLayout {
 
     $processesWithBlankDesktop = @(
         $capturedRows |
-            Where-Object { $null -eq $_.desktop } |
-            ForEach-Object { $_.processName } |
+            Group-Object -Property processName |
+            Where-Object {
+                $processName = [string]$_.Name
+                $processKey = $processName.ToLowerInvariant()
+                $hasDesktop = @($_.Group | Where-Object { $null -ne $_.desktop }).Count -gt 0
+                (-not $protectedProcesses.ContainsKey($processKey)) -and (-not $hasDesktop)
+            } |
+            ForEach-Object { $_.Name } |
             Sort-Object -Unique
     )
 
-    if ($processesWithBlankDesktop.Count -gt 0) {
+    if (-not $IgnoreBlacklist -and $processesWithBlankDesktop.Count -gt 0) {
         [void](Add-IgnoredProcesses -ProcessNames $processesWithBlankDesktop)
         $capturedRows = @($capturedRows | Where-Object { $processesWithBlankDesktop -notcontains $_.processName })
         Add-PendingMessage ("Ignored processes with no usable desktop: {0}" -f ($processesWithBlankDesktop -join ', '))
+    }
+    elseif ($IgnoreBlacklist) {
+        Add-PendingMessage 'Capture ignored processes blacklist and kept windows even when their desktop number was unavailable.'
     }
 
     $layoutWindows = @()
@@ -1898,7 +2002,7 @@ function Show-Menu {
                     return
                 }
 
-                $snapshot = Capture-CurrentLayout -Config $Config -CaptureTarget $target
+                $snapshot = Capture-CurrentLayout -Config $Config -CaptureTarget $target -IgnoreBlacklist:$IgnoreBlacklist
                 Save-CapturedLayout -Config $snapshot
                 Write-Host ''
                 Write-Host ("Saved current layout to '{0}'." -f $script:CurrentLayoutPath)
@@ -1931,12 +2035,12 @@ if ($ListLayouts) {
 
 if ($CaptureCurrent) {
     Show-PendingMessages
-    $target = Select-MonitorSetupForCapture -Config $config
+    $target = Resolve-CaptureTarget -Config $config
     if ($null -eq $target) {
         exit 0
     }
 
-    $snapshot = Capture-CurrentLayout -Config $config -CaptureTarget $target
+    $snapshot = Capture-CurrentLayout -Config $config -CaptureTarget $target -IgnoreBlacklist:$IgnoreBlacklist
     Save-CapturedLayout -Config $snapshot
     Write-Host "Saved current layout to '$script:CurrentLayoutPath'."
     Write-Host "Copy the monitor setup and layout you want into '$script:ConfigPath', remove the rows you do not need, and see '$(Join-Path $script:RootDirectory 'readme.txt')' for details."
