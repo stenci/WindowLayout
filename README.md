@@ -44,13 +44,13 @@ When `WindowLayout\window_layouts.txt` is reformatted, the script also regenerat
 - `Portable`: runs directly from a folder such as the desktop
 - `Monitor setups`: separate physical monitor arrangements from window layouts
 - `Relative monitor matching`: matches the current monitors to a saved setup by relative position, not Windows numbering
-- `Capture workflow`: saves the current layout to `current_layout.txt`, which you can trim and copy into `window_layouts.txt`
+- `Capture workflow`: saves the current layout to `current_layout.txt` with a timestamped comment header, and you can trim and copy parts into `window_layouts.txt`
 - `Readable config`: uses a pipe-delimited text format instead of JSON
 - `Regex titles`: supports `regex` title matching, including `|` inside regex patterns
 - `Cascade support`: capture emits both a cascade row and individual rows for multi-instance apps
 - `Virtual desktops`: captures and restores a manually editable desktop number for each window
 - `Editable percentages`: capture writes integer `x`, `y`, `w`, and `h` values, but you can manually change them to decimals for finer positioning
-- `Ignore list`: processes without a valid desktop number are written to `processes_to_ignore.txt` and excluded from future captures and restores
+- `Ignore list`: processes whose captured windows never resolve to a valid desktop number are written to `processes_to_ignore.txt` and excluded from future captures and restores
 
 ## Folder Layout
 
@@ -63,11 +63,11 @@ WindowLayout/
   readme.txt
 ```
 
-`window_layouts.txt` is created on first run.
+`window_layouts.txt` is created on first run with a comment header and a blank line before the content.
 
 Per-layout `.cmd` shortcut scripts inside `WindowLayout\` are generated from `window_layouts.txt` when it is reformatted.
 
-`current_layout.txt` is generated only when you capture a layout.
+`current_layout.txt` is generated only when you capture a layout. It includes a timestamped comment header and a blank line before the captured content.
 
 `processes_to_ignore.txt` is updated automatically when capture finds processes without a valid desktop number.
 
@@ -79,7 +79,9 @@ Per-layout `.cmd` shortcut scripts inside `WindowLayout\` are generated from `wi
 4. Choose a saved layout, or capture the current layout.
 5. After capture, copy the parts you want from `current_layout.txt` into `window_layouts.txt`.
 
-Capture usually sees more windows than you want to keep, including helper windows and some windows that are not obvious at first glance. Processes without a valid desktop number are not written to `current_layout.txt`; instead, their process names are added to `WindowLayout\processes_to_ignore.txt`.
+When you create a new monitor setup, capture first lists the detected monitors, then asks you to name each monitor, then asks for the monitor configuration name.
+
+Capture usually sees more windows than you want to keep, including helper windows and some windows that are not obvious at first glance. Individual windows without a valid desktop number are not written to `current_layout.txt`; if all captured windows for a process lack a valid desktop number, that process name is added to `WindowLayout\processes_to_ignore.txt`.
 
 ## Configuration Model
 
@@ -144,7 +146,8 @@ That shows a useful pattern:
 ## Capture Notes
 
 - Capture learns ignored processes automatically and stores them in `WindowLayout\processes_to_ignore.txt`
-- Processes without a valid desktop number are blacklisted and omitted from `current_layout.txt`
+- Individual windows without a valid desktop number are omitted from `current_layout.txt`
+- If all captured windows for a process have no valid desktop number, that process is blacklisted
 - `WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist` captures the full visible window list for troubleshooting, including blacklisted processes and windows without a usable desktop number
 - Capture still writes integer percentages, but manual decimal edits in `window_layouts.txt` are preserved when the file is reformatted
 

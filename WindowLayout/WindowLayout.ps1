@@ -320,6 +320,38 @@ function New-DefaultConfig {
     }
 }
 
+function Get-ConfigFileHeader {
+    return @(
+        '# These layouts are used by the script.',
+        '# Edit this file to control which window layouts can be applied.',
+        '',
+        ''
+    ) -join [Environment]::NewLine
+}
+
+function Get-CapturedLayoutHeader {
+    $capturedAt = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+    return @(
+        ('# This window layout was captured at {0}.' -f $capturedAt),
+        '# Copy all or part of this file into window_layouts.txt if you want to save it.',
+        '# These captured layouts are not used by the script.',
+        '',
+        ''
+    ) -join [Environment]::NewLine
+}
+
+function ConvertTo-ConfigFileText {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    return (Get-ConfigFileHeader) + (ConvertTo-ConfigText -Config $Config)
+}
+
+function ConvertTo-CapturedLayoutFileText {
+    param([Parameter(Mandatory = $true)]$Config)
+
+    return (Get-CapturedLayoutHeader) + (ConvertTo-ConfigText -Config $Config)
+}
+
 function Add-PendingMessage {
     param([Parameter(Mandatory = $true)][string]$Message)
 
@@ -470,7 +502,7 @@ function Show-MenuHeader {
 
 function Ensure-ConfigFile {
     if (-not (Test-Path -LiteralPath $script:ConfigPath)) {
-        [System.IO.File]::WriteAllText($script:ConfigPath, '', (New-Object System.Text.UTF8Encoding($true)))
+        [System.IO.File]::WriteAllText($script:ConfigPath, (Get-ConfigFileHeader), (New-Object System.Text.UTF8Encoding($true)))
     }
 }
 
@@ -1065,7 +1097,7 @@ function Get-Config {
     $raw = Get-Content -LiteralPath $script:ConfigPath -Raw -Encoding UTF8
     $config = ConvertTo-ConfigFromText -Text $raw
     Validate-Config -Config $config
-    $wasReformatted = Write-FormattedConfigIfNeeded -Path $script:ConfigPath -FormattedText (ConvertTo-ConfigText -Config $config)
+    $wasReformatted = Write-FormattedConfigIfNeeded -Path $script:ConfigPath -FormattedText (ConvertTo-ConfigFileText -Config $config)
     if ($wasReformatted) {
         [void](Sync-LayoutShortcutScripts -Config $config)
         Add-PendingMessage -Message "Reformatted and saved '$script:ConfigPath'."
@@ -1722,33 +1754,76 @@ function Get-SizePercent {
     return [int]$percent
 }
 
-function New-RoleFromCoordinates {
-    param(
-        [int]$X,
-        [int]$Y
-    )
+function Get-MonitorLetterLabel {
+    param([Parameter(Mandatory = $true)][int]$Index)
 
-    return "x$X`_y$Y"
+    if ($Index -lt 1) {
+        throw 'Monitor index must be at least 1.'
+    }
+
+    $value = $Index
+    $label = ''
+    while ($value -gt 0) {
+        $remainder = ($value - 1) % 26
+        $label = ([char]([int][char]'A' + $remainder)) + $label
+        $value = [int](($value - 1) / 26)
+    }
+
+    return $label
 }
 
-function New-MonitorSetupFromCurrentMonitors {
-    param(
-        [Parameter(Mandatory = $true)][string]$Name,
-        [Parameter(Mandatory = $true)]$ActualMonitors
-    )
+function Read-RequiredText {
+    param([Parameter(Mandatory = $true)][string]$Prompt)
 
-    $monitors = foreach ($monitor in $ActualMonitors) {
-        [pscustomobject]@{
-            role = New-RoleFromCoordinates -X $monitor.X -Y $monitor.Y
+    while ($true) {
+        Write-Host ''
+        $value = Read-Host $Prompt
+        Write-Host ''
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            return $value.Trim()
+        }
+
+        Write-Host 'Please enter a value.'
+    }
+}
+
+function New-MonitorSetupInteractively {
+    param([Parameter(Mandatory = $true)]$ActualMonitors)
+
+    Write-Host ('Found {0} monitors:' -f $ActualMonitors.Count)
+    for ($i = 0; $i -lt $ActualMonitors.Count; $i++) {
+        $monitor = $ActualMonitors[$i]
+        $label = Get-MonitorLetterLabel -Index ($i + 1)
+
+        Write-Host ('Monitor {0}: {1} x {2} at {3},{4}' -f $label, $monitor.Width, $monitor.Height, $monitor.X, $monitor.Y)
+    }
+
+    $monitors = @()
+    for ($i = 0; $i -lt $ActualMonitors.Count; $i++) {
+        $monitor = $ActualMonitors[$i]
+        $label = Get-MonitorLetterLabel -Index ($i + 1)
+        $role = Read-RequiredText -Prompt ('Please enter name for monitor {0} (example "Main", "Left", "Wide screen", etc.)' -f $label)
+        $monitors += [pscustomobject]@{
+            role = $role
             x    = $monitor.X
             y    = $monitor.Y
         }
     }
 
+    $name = Read-RequiredText -Prompt 'Please enter name for monitor configuration (example "Main", "Office", etc.)'
+
     return [pscustomobject]@{
-        name     = $Name
+        name     = $name
         monitors = @($monitors)
     }
+}
+
+function New-MonitorSetupFromCurrentMonitors {
+    param(
+        [Parameter(Mandatory = $true)]$ActualMonitors
+    )
+
+    return New-MonitorSetupInteractively -ActualMonitors $ActualMonitors
 }
 
 function Read-ChoiceNumber {
@@ -1761,7 +1836,9 @@ function Read-ChoiceNumber {
     )
 
     while ($true) {
+        Write-Host ''
         $choice = Read-Host $Prompt
+        Write-Host ''
         if ($AllowBlank -and [string]::IsNullOrWhiteSpace($choice)) {
             return $BlankValue
         }
@@ -1780,13 +1857,8 @@ function Select-MonitorSetupForCapture {
 
     $actualMonitors = @(Get-ActualMonitors)
     if ($Config.monitorSetups.Count -eq 0) {
-        $name = Read-Host "No monitor setups exist yet. Enter a name for the new monitor setup"
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = 'Current setup'
-        }
-
         return [pscustomobject]@{
-            setup = New-MonitorSetupFromCurrentMonitors -Name $name -ActualMonitors $actualMonitors
+            setup = New-MonitorSetupFromCurrentMonitors -ActualMonitors $actualMonitors
             isNew = $true
         }
     }
@@ -1797,7 +1869,7 @@ function Select-MonitorSetupForCapture {
         Write-Host ("{0}. {1}" -f $index, $setup.name)
         $index++
     }
-    Write-Host ("{0}. create new monitor setup" -f $index)
+    Write-Host ("{0}. Create new monitor setup" -f $index)
 
     $selection = Read-ChoiceNumber -Prompt 'Choose an option' -Minimum 1 -Maximum $index -AllowBlank -BlankValue 0
     if ($selection -eq 0) {
@@ -1805,13 +1877,8 @@ function Select-MonitorSetupForCapture {
     }
 
     if ($selection -eq $index) {
-        $name = Read-Host 'Enter the new monitor setup name'
-        if ([string]::IsNullOrWhiteSpace($name)) {
-            $name = 'Current setup'
-        }
-
         return [pscustomobject]@{
-            setup = New-MonitorSetupFromCurrentMonitors -Name $name -ActualMonitors $actualMonitors
+            setup = New-MonitorSetupFromCurrentMonitors -ActualMonitors $actualMonitors
             isNew = $true
         }
     }
@@ -1889,23 +1956,40 @@ function Capture-CurrentLayout {
         }
     }
 
+    $rowsWithBlankDesktop = @(
+        $capturedRows | Where-Object {
+            $processKey = $_.processName.ToLowerInvariant()
+            (-not $protectedProcesses.ContainsKey($processKey)) -and $null -eq $_.desktop
+        }
+    )
+
     $processesWithBlankDesktop = @(
-        $capturedRows |
+        $rowsWithBlankDesktop |
             Group-Object -Property processName |
             Where-Object {
                 $processName = [string]$_.Name
                 $processKey = $processName.ToLowerInvariant()
-                $hasDesktop = @($_.Group | Where-Object { $null -ne $_.desktop }).Count -gt 0
+                $hasDesktop = @($capturedRows | Where-Object {
+                    $_.processName -eq $processName -and $null -ne $_.desktop
+                }).Count -gt 0
                 (-not $protectedProcesses.ContainsKey($processKey)) -and (-not $hasDesktop)
             } |
             ForEach-Object { $_.Name } |
             Sort-Object -Unique
     )
 
-    if (-not $IgnoreBlacklist -and $processesWithBlankDesktop.Count -gt 0) {
-        [void](Add-IgnoredProcesses -ProcessNames $processesWithBlankDesktop)
-        $capturedRows = @($capturedRows | Where-Object { $processesWithBlankDesktop -notcontains $_.processName })
-        Add-PendingMessage ("Ignored processes with no usable desktop: {0}" -f ($processesWithBlankDesktop -join ', '))
+    if (-not $IgnoreBlacklist -and $rowsWithBlankDesktop.Count -gt 0) {
+        if ($processesWithBlankDesktop.Count -gt 0) {
+            [void](Add-IgnoredProcesses -ProcessNames $processesWithBlankDesktop)
+            Add-PendingMessage ("Ignored processes with no usable desktop: {0}" -f ($processesWithBlankDesktop -join ', '))
+        }
+
+        $capturedRows = @($capturedRows | Where-Object {
+            $processKey = $_.processName.ToLowerInvariant()
+            $protectedProcesses.ContainsKey($processKey) -or $null -ne $_.desktop
+        })
+
+        Add-PendingMessage ("Skipped {0} captured window(s) with no usable desktop number." -f $rowsWithBlankDesktop.Count)
     }
     elseif ($IgnoreBlacklist) {
         Add-PendingMessage 'Capture ignored processes blacklist and kept windows even when their desktop number was unavailable.'
@@ -1953,7 +2037,7 @@ function Save-CapturedLayout {
         [Parameter(Mandatory = $true)]$Config
     )
 
-    $text = ConvertTo-ConfigText -Config $Config
+    $text = ConvertTo-CapturedLayoutFileText -Config $Config
     Set-Content -LiteralPath $script:CurrentLayoutPath -Value $text -Encoding UTF8
 }
 
@@ -1971,15 +2055,14 @@ function Show-Menu {
         foreach ($layout in $Config.layouts) {
             $label = "$($layout.monitorSetup) - $($layout.name)"
             $options += [pscustomobject]@{ Number = $index; Action = 'apply'; Layout = $layout; Label = $label }
-            Write-Host ("{0}. set window layout '{1}'" -f $index, $label)
+            Write-Host ("{0}. Set window layout '{1}'" -f $index, $label)
             $index++
         }
 
         $captureNumber = $index
         $options += [pscustomobject]@{ Number = $captureNumber; Action = 'capture' }
-        Write-Host ("{0}. get current window layout" -f $captureNumber)
-        Write-Host '0. exit'
-        Write-Host ''
+        Write-Host ("{0}. Get current window layout" -f $captureNumber)
+        Write-Host '0. Exit'
 
         $choice = Read-ChoiceNumber -Prompt 'Choose an option' -Minimum 0 -Maximum $captureNumber -AllowBlank -BlankValue 0
         if ($choice -eq 0) {

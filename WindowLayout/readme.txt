@@ -11,9 +11,9 @@ Why this is useful
 Files
 - WindowLayout.cmd must stay next to the WindowLayout folder.
 - WindowLayout\WindowLayout.ps1 is the main script.
-- WindowLayout\window_layouts.txt is the editable layouts file. It is created automatically on first run.
+- WindowLayout\window_layouts.txt is the editable layouts file. It is created automatically on first run with a comment header and a blank line before the content.
 - WindowLayout\WindowLayout - <monitor setup> - <layout>.cmd files are generated from window_layouts.txt when that file is reformatted.
-- WindowLayout\current_layout.txt is generated only when you capture the current layout.
+- WindowLayout\current_layout.txt is generated only when you capture the current layout. It includes a comment header with the capture date and time, followed by a blank line.
 - WindowLayout\processes_to_ignore.txt is maintained automatically for processes without a valid desktop number.
 
 Setup examples:
@@ -27,11 +27,14 @@ How to use it
 1. Double-click WindowLayout.cmd.
 2. Choose a layout from the menu in the form "monitor setup - layout".
 3. Or choose to capture the current layout.
-4. During capture, choose which monitor setup to map the current monitors to.
-5. After capture, open current_layout.txt, copy the monitor setup or layout you want into window_layouts.txt, and remove the rows you do not need.
-6. Capture usually includes more windows than you want, including helper windows and some windows that are not obvious at first glance.
-7. Processes without a valid desktop number are added to processes_to_ignore.txt instead of being written to current_layout.txt.
-8. For troubleshooting, run WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist to capture the full visible window list, including blacklisted processes and windows with no usable desktop number.
+4. During capture, choose which monitor setup to map the current monitors to, or create a new one.
+5. When creating a new monitor setup, capture first lists all detected monitors, then asks you to name each monitor, then asks for the monitor configuration name.
+6. After capture, open current_layout.txt, copy the monitor setup or layout you want into window_layouts.txt, and remove the rows you do not need.
+7. current_layout.txt is only a captured snapshot and is not used by the script unless you copy parts of it into window_layouts.txt.
+8. Capture usually includes more windows than you want, including helper windows and some windows that are not obvious at first glance.
+9. Individual windows without a valid desktop number are skipped in current_layout.txt.
+10. If all captured windows for a process have no valid desktop number, that process is added to processes_to_ignore.txt.
+11. For troubleshooting, run WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist to capture the full visible window list, including blacklisted processes and windows with no usable desktop number.
 
 Direct shortcut script
 - You can also run a layout directly from the command line:
@@ -100,11 +103,12 @@ Monitor setups
 - The script matches the currently connected monitors to the selected monitor setup by relative monitor positions, not by Windows monitor numbering.
 
 Capture behavior
-- If the config has no monitor setups yet, capture asks for a name and creates the first monitor setup from the current monitors.
-- If monitor setups already exist, capture asks which setup to use, or lets you create a new one.
+- If the config has no monitor setups yet, capture lists the detected monitors, asks you to name each monitor, then asks for the monitor configuration name.
+- If monitor setups already exist, capture asks which setup to use, or lets you create a new one with the same interactive naming flow.
 - The monitor match is tolerant: it does not require a perfect coordinate or size match.
 - Capture records the virtual desktop number for each included window.
-- Processes without a valid desktop number are added to processes_to_ignore.txt and left out of current_layout.txt.
+- Individual windows without a valid desktop number are left out of current_layout.txt.
+- If all captured windows for a process have no valid desktop number, that process is added to processes_to_ignore.txt.
 - Running WindowLayout.cmd -CaptureCurrent -IgnoreBlacklist bypasses that filter and keeps those rows in current_layout.txt with a blank desktop column.
 - For multi-instance applications, capture emits both:
   - one cascade row with an empty title
@@ -126,7 +130,7 @@ Menu behavior
 
 Restart from scratch
 - Delete WindowLayout\window_layouts.txt and WindowLayout\current_layout.txt.
-- On the next run, the script recreates a fresh empty window_layouts.txt.
+- On the next run, the script recreates window_layouts.txt with its comment header and blank line.
 
 Command line examples
 - WindowLayout.cmd
